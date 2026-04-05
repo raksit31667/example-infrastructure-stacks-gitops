@@ -1,0 +1,335 @@
+name: Microservice Stacks Provision (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        type: string
+        required: true
+        description: "Service name (e.g. booking)"
+      deployment_name:
+        type: string
+        required: true
+        description: "Deployment name (e.g. booking-production)"
+      stack_path:
+        type: string
+        required: true
+        description: "Path to the service stack directory (e.g. stacks/services/booking)"
+      environment:
+        type: string
+        required: true
+        description: "Target environment (production, staging, test)"
+      contract_version:
+        type: string
+        required: false
+        default: "latest"
+        description: "Infrastructure contract version to validate against (use 'latest' for most recent)"
+      apply_changes:
+        type: boolean
+        required: false
+        default: false
+        description: "Whether to apply changes (true for master/main, false for PR validation)"
+
+concurrency:
+  group: microservice-${{ inputs.service_name }}-${{ inputs.deployment_name }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.14.5"
+  AWS_REGION: "<AWS_REGION>"
+  CONTRACT_BUCKET: "<TF_STATE_BUCKET_NAME>"
+
+jobs:
+  # ── Resolve & Validate Contract ───────────────────────────────────────────
+  resolve_contract:
+    name: Resolve Contract — ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    outputs:
+      vpc_id: ${{ steps.parse.outputs.vpc_id }}
+      elasticache_sg_id: ${{ steps.parse.outputs.elasticache_sg_id }}
+      private_subnets: ${{ steps.parse.outputs.private_subnets }}
+      contract_version: ${{ steps.parse.outputs.contract_version }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: svc-contract-${{ github.run_id }}
+
+      - name: Download contract from S3
+        run: |
+          if [[ "${{ inputs.contract_version }}" == "latest" ]]; then
+            OBJECT_KEY="contracts/${{ inputs.environment }}/latest.json"
+          else
+            OBJECT_KEY="contracts/${{ inputs.environment }}/contract-${{ inputs.contract_version }}.json"
+          fi
+
+          echo "Downloading: s3://${{ env.CONTRACT_BUCKET }}/${OBJECT_KEY}"
+          aws s3 cp \
+            "s3://${{ env.CONTRACT_BUCKET }}/${OBJECT_KEY}" \
+            contract.json \
+            --region ${{ env.AWS_REGION }} || {
+              echo "ERROR: Infrastructure contract not found at s3://${{ env.CONTRACT_BUCKET }}/${OBJECT_KEY}"
+              echo "Run the infrastructure-provision workflow for the '${{ inputs.environment }}' environment first."
+              exit 1
+            }
+
+      - name: Validate contract schema and extract values
+        id: parse
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, os
+
+          required_keys = {
+            "vpc_id", "private_subnets", "elasticache_sg_id",
+            "environment", "contract_version"
+          }
+
+          with open("contract.json") as f:
+            c = json.load(f)
+
+          missing = required_keys - set(c.keys())
+          if missing:
+            print(f"ERROR: Contract missing required keys: {missing}", file=sys.stderr)
+            sys.exit(1)
+
+          if c["environment"] != os.environ["TARGET_ENV"]:
+            print(
+              f"ERROR: Contract environment '{c['environment']}' does not match "
+              f"expected '{os.environ['TARGET_ENV']}'",
+              file=sys.stderr,
+            )
+            sys.exit(1)
+
+          # Emit outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"vpc_id={c['vpc_id']}\n")
+            out.write(f"elasticache_sg_id={c['elasticache_sg_id']}\n")
+            out.write(f"private_subnets={json.dumps(c['private_subnets'])}\n")
+            out.write(f"contract_version={c['contract_version']}\n")
+
+          print(f"Contract validated: {c['contract_version']}")
+          PYEOF
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+
+  # ── Validate & Plan ───────────────────────────────────────────────────────
+  validate_and_plan:
+    name: Validate & Plan — ${{ inputs.service_name }}
+    needs: [resolve_contract]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: svc-plan-${{ github.run_id }}
+
+      - name: Terraform Stacks Init
+        working-directory: ${{ inputs.stack_path }}
+        run: terraform stacks init
+
+      - name: Terraform Stacks Validate
+        working-directory: ${{ inputs.stack_path }}
+        run: terraform stacks validate
+
+      - name: Inject contract values into deploy file
+        working-directory: ${{ inputs.stack_path }}
+        env:
+          VPC_ID: ${{ needs.resolve_contract.outputs.vpc_id }}
+          ELASTICACHE_SG_ID: ${{ needs.resolve_contract.outputs.elasticache_sg_id }}
+          PRIVATE_SUBNETS_JSON: ${{ needs.resolve_contract.outputs.private_subnets }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          DEPLOY_FILE=$(find . -maxdepth 1 -name "*.tfdeploy.hcl" | head -1)
+          if [[ -z "${DEPLOY_FILE}" ]]; then
+            echo "ERROR: No .tfdeploy.hcl file found in ${PWD}"
+            exit 1
+          fi
+
+          ENV_UPPER=$(echo "${TARGET_ENV}" | tr '[:lower:]' '[:upper:]')
+          PRIVATE_SUBNETS_JSON_ESCAPED=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])).replace("\"", "\\\\\""))' "${PRIVATE_SUBNETS_JSON}")
+
+          sed -i \
+            -e "s|<VPC_ID_${ENV_UPPER}>|${VPC_ID}|g" \
+            -e "s|<ELASTICACHE_SG_ID_${ENV_UPPER}>|${ELASTICACHE_SG_ID}|g" \
+            -e "s|<PRIVATE_SUBNETS_${ENV_UPPER}_JSON>|${PRIVATE_SUBNETS_JSON_ESCAPED}|g" \
+            "${DEPLOY_FILE}"
+
+          echo "Injected contract values into ${DEPLOY_FILE}"
+
+      - name: Terraform Stacks Plan
+        id: plan
+        working-directory: ${{ inputs.stack_path }}
+        env:
+          TF_LOG: "WARN"
+        run: |
+          terraform stacks plan \
+            -deployment ${{ inputs.deployment_name }} \
+            -no-color 2>&1 | tee plan.log
+          echo "plan_exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: svc-plan-${{ inputs.service_name }}-${{ inputs.deployment_name }}-${{ github.run_id }}
+          path: ${{ inputs.stack_path }}/plan.log
+          retention-days: 7
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ inputs.stack_path }}/plan.log', 'utf8');
+            const body = [
+              `## Stack Plan: \`${{ inputs.service_name }}\` — \`${{ inputs.deployment_name }}\``,
+              `> Contract version: \`${{ needs.resolve_contract.outputs.contract_version }}\``,
+              '```',
+              plan.substring(0, 60000),
+              '```',
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  # ── Approval Gate ─────────────────────────────────────────────────────────
+  approval_gate:
+    name: Approval Gate — ${{ inputs.service_name }}
+    needs: [validate_and_plan]
+    runs-on: ubuntu-latest
+    environment: infra-release
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Deployment approved
+        run: echo "Deployment of ${{ inputs.service_name }} to ${{ inputs.environment }} approved by ${{ github.actor }}"
+
+  # ── Apply ─────────────────────────────────────────────────────────────────
+  apply:
+    name: Apply — ${{ inputs.service_name }}
+    needs: [approval_gate, resolve_contract]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: svc-apply-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Terraform Stacks Init
+        working-directory: ${{ inputs.stack_path }}
+        run: terraform stacks init
+
+      - name: Inject contract values into deploy file
+        working-directory: ${{ inputs.stack_path }}
+        env:
+          VPC_ID: ${{ needs.resolve_contract.outputs.vpc_id }}
+          ELASTICACHE_SG_ID: ${{ needs.resolve_contract.outputs.elasticache_sg_id }}
+          PRIVATE_SUBNETS_JSON: ${{ needs.resolve_contract.outputs.private_subnets }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          DEPLOY_FILE=$(find . -maxdepth 1 -name "*.tfdeploy.hcl" | head -1)
+          if [[ -z "${DEPLOY_FILE}" ]]; then
+            echo "ERROR: No .tfdeploy.hcl file found in ${PWD}"
+            exit 1
+          fi
+
+          ENV_UPPER=$(echo "${TARGET_ENV}" | tr '[:lower:]' '[:upper:]')
+          PRIVATE_SUBNETS_JSON_ESCAPED=$(python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])).replace("\"", "\\\\\""))' "${PRIVATE_SUBNETS_JSON}")
+
+          sed -i \
+            -e "s|<VPC_ID_${ENV_UPPER}>|${VPC_ID}|g" \
+            -e "s|<ELASTICACHE_SG_ID_${ENV_UPPER}>|${ELASTICACHE_SG_ID}|g" \
+            -e "s|<PRIVATE_SUBNETS_${ENV_UPPER}_JSON>|${PRIVATE_SUBNETS_JSON_ESCAPED}|g" \
+            "${DEPLOY_FILE}"
+
+          echo "Injected contract values into ${DEPLOY_FILE}"
+
+      - name: Terraform Stacks Apply
+        working-directory: ${{ inputs.stack_path }}
+        env:
+          TF_LOG: "WARN"
+        run: |
+          terraform stacks apply \
+            -deployment ${{ inputs.deployment_name }} \
+            -no-color 2>&1 | tee apply.log
+          echo "Apply exit code: ${PIPESTATUS[0]}"
+
+      - name: Upload apply artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: svc-apply-${{ inputs.service_name }}-${{ inputs.deployment_name }}-${{ github.run_id }}
+          path: ${{ inputs.stack_path }}/apply.log
+          retention-days: 30
+
+  # ── Post-Deploy Service Tests ─────────────────────────────────────────────
+  service_tests:
+    name: Service Tests — ${{ inputs.service_name }}
+    needs: [apply]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: svc-test-${{ github.run_id }}
+
+      - name: Test ECR repository
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ inputs.service_name }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'repositories[0].[repositoryUri,imageScanningConfiguration.scanOnPush]' \
+            --output table
+
+      - name: Test Secrets Manager secret
+        run: |
+          aws secretsmanager describe-secret \
+            --secret-id "${{ inputs.service_name }}-${{ inputs.environment }}-secret" \
+            --region "${{ env.AWS_REGION }}" \
+            --query '[Name,ARN,LastChangedDate]' \
+            --output table
+
+      - name: Test ElastiCache cluster
+        run: |
+          aws elasticache describe-serverless-caches \
+            --serverless-cache-name "${{ inputs.service_name }}-${{ inputs.environment }}-cache" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'ServerlessCaches[0].[ServerlessCacheName,Engine,Status]' \
+            --output table

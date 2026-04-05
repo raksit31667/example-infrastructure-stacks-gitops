@@ -1,0 +1,265 @@
+name: Infrastructure Stacks Provision
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - infratest
+          - staging
+          - production
+      apply_changes:
+        description: "Apply changes (false = plan only)"
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: infrastructure-<AWS_ACCOUNT_ID>-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TF_VERSION: "1.14.5"
+  AWS_REGION: "<AWS_REGION>"
+  STACK_PATH: stacks/infrastructure
+  CONTRACT_BUCKET: "<TF_STATE_BUCKET_NAME>"
+
+jobs:
+  # ── Validate ──────────────────────────────────────────────────────────────
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: infra-validate-${{ github.run_id }}
+
+      - name: Terraform Stacks Init
+        working-directory: ${{ env.STACK_PATH }}
+        run: terraform stacks init
+
+      - name: Terraform Stacks Validate
+        working-directory: ${{ env.STACK_PATH }}
+        run: terraform stacks validate
+
+  # ── Plan ──────────────────────────────────────────────────────────────────
+  plan:
+    name: Plan — ${{ inputs.environment }}
+    needs: [validate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: infra-plan-${{ github.run_id }}
+
+      - name: Terraform Stacks Init
+        working-directory: ${{ env.STACK_PATH }}
+        run: terraform stacks init
+
+      - name: Terraform Stacks Plan
+        working-directory: ${{ env.STACK_PATH }}
+        env:
+          TF_LOG: "WARN"
+        run: |
+          terraform stacks plan \
+            -deployment ${{ inputs.environment }} \
+            -no-color 2>&1 | tee plan.log
+          echo "Plan exit code: ${PIPESTATUS[0]}"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-plan-${{ inputs.environment }}-${{ github.run_id }}
+          path: |
+            ${{ env.STACK_PATH }}/plan.log
+          retention-days: 7
+
+  # ── Approval Gate ─────────────────────────────────────────────────────────
+  approval_gate:
+    name: Approval Gate — ${{ inputs.environment }}
+    needs: [plan]
+    runs-on: ubuntu-latest
+    environment: infra-release
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Deployment approved
+        run: echo "Deployment to ${{ inputs.environment }} approved by ${{ github.actor }}"
+
+  # ── Apply ─────────────────────────────────────────────────────────────────
+  apply:
+    name: Apply — ${{ inputs.environment }}
+    needs: [approval_gate]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: infra-apply-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Terraform Stacks Init
+        working-directory: ${{ env.STACK_PATH }}
+        run: terraform stacks init
+
+      - name: Terraform Stacks Apply
+        working-directory: ${{ env.STACK_PATH }}
+        env:
+          TF_LOG: "WARN"
+        run: |
+          terraform stacks apply \
+            -deployment ${{ inputs.environment }} \
+            -no-color 2>&1 | tee apply.log
+          echo "Apply exit code: ${PIPESTATUS[0]}"
+
+      - name: Upload apply artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-apply-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.STACK_PATH }}/apply.log
+          retention-days: 30
+
+  # ── Publish Contract ──────────────────────────────────────────────────────
+  publish_contract:
+    name: Publish Contract — ${{ inputs.environment }}
+    needs: [apply]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: infra-contract-${{ github.run_id }}
+
+      - name: Generate infrastructure contract
+        id: contract
+        working-directory: ${{ env.STACK_PATH }}
+        run: |
+          terraform stacks init
+
+          CONTRACT_VERSION="${{ github.sha }}-${{ github.run_id }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          VPC_ID=$(terraform stacks output -deployment ${{ inputs.environment }} -raw vpc_id)
+          PRIVATE_SUBNETS=$(terraform stacks output -deployment ${{ inputs.environment }} -json private_subnet_ids)
+          PUBLIC_SUBNETS=$(terraform stacks output -deployment ${{ inputs.environment }} -json public_subnet_ids)
+          CLUSTER_NAME=$(terraform stacks output -deployment ${{ inputs.environment }} -raw cluster_name)
+          CLUSTER_SG_ID=$(terraform stacks output -deployment ${{ inputs.environment }} -raw cluster_sg_id)
+          ELASTICACHE_SG_ID=$(terraform stacks output -deployment ${{ inputs.environment }} -raw elasticache_sg_id)
+
+          cat > contract.json <<EOF
+          {
+            "vpc_id": "${VPC_ID}",
+            "private_subnets": ${PRIVATE_SUBNETS},
+            "public_subnets": ${PUBLIC_SUBNETS},
+            "cluster_name": "${CLUSTER_NAME}",
+            "cluster_sg_id": "${CLUSTER_SG_ID}",
+            "elasticache_sg_id": "${ELASTICACHE_SG_ID}",
+            "account_id": "<AWS_ACCOUNT_ID>",
+            "environment": "${{ inputs.environment }}",
+            "git_sha": "${{ github.sha }}",
+            "run_id": "${{ github.run_id }}",
+            "timestamp": "${TIMESTAMP}",
+            "contract_version": "${CONTRACT_VERSION}"
+          }
+          EOF
+
+          echo "contract_version=${CONTRACT_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Contract generated: ${CONTRACT_VERSION}"
+
+      - name: Validate contract schema
+        working-directory: ${{ env.STACK_PATH }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys
+          required_keys = {
+            "vpc_id", "private_subnets", "public_subnets",
+            "cluster_name", "cluster_sg_id", "elasticache_sg_id",
+            "account_id", "environment", "git_sha", "run_id",
+            "timestamp", "contract_version"
+          }
+          with open("contract.json") as f:
+            contract = json.load(f)
+          missing = required_keys - set(contract.keys())
+          if missing:
+            print(f"ERROR: Contract missing required keys: {missing}", file=sys.stderr)
+            sys.exit(1)
+          print("Contract schema validated successfully.")
+          PYEOF
+
+      - name: Upload contract to S3
+        working-directory: ${{ env.STACK_PATH }}
+        run: |
+          CONTRACT_VERSION="${{ steps.contract.outputs.contract_version }}"
+
+          # Upload versioned copy
+          aws s3 cp contract.json \
+            "s3://${{ env.CONTRACT_BUCKET }}/contracts/${{ inputs.environment }}/contract-${CONTRACT_VERSION}.json" \
+            --region ${{ env.AWS_REGION }} \
+            --no-progress
+
+          # Update the latest pointer
+          aws s3 cp contract.json \
+            "s3://${{ env.CONTRACT_BUCKET }}/contracts/${{ inputs.environment }}/latest.json" \
+            --region ${{ env.AWS_REGION }} \
+            --no-progress
+
+          echo "Contract published: s3://${{ env.CONTRACT_BUCKET }}/contracts/${{ inputs.environment }}/contract-${CONTRACT_VERSION}.json"
+          echo "contract_version=${CONTRACT_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload contract artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-contract-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.STACK_PATH }}/contract.json
+          retention-days: 90

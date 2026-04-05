@@ -1,0 +1,35 @@
+name: Test — booking Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      contract_version:
+        description: "Infrastructure contract version to validate against (leave blank for latest)"
+        required: false
+        default: "latest"
+  pull_request:
+    paths:
+      - ".github/workflows/microservice-booking-test.yaml"
+      - "stacks/services/booking/**"
+
+concurrency:
+  group: microservice-booking-test-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  provision:
+    name: Validate booking — Test
+    uses: ./.github/workflows/microservice-stacks-provision.yaml
+    with:
+      service_name: booking
+      deployment_name: booking-test
+      stack_path: stacks/services/booking
+      environment: test
+      contract_version: ${{ inputs.contract_version || 'latest' }}
+      # Plan only — never auto-apply on PRs
+      apply_changes: false

@@ -1,0 +1,40 @@
+name: Staging — booking Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      contract_version:
+        description: "Infrastructure contract version to validate against (leave blank for latest)"
+        required: false
+        default: "latest"
+      apply_changes:
+        description: "Apply changes"
+        required: true
+        type: boolean
+        default: false
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/microservice-booking-staging.yaml"
+      - "stacks/services/booking/**"
+
+concurrency:
+  group: microservice-booking-staging
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  provision:
+    name: Provision booking — Staging
+    uses: ./.github/workflows/microservice-stacks-provision.yaml
+    with:
+      service_name: booking
+      deployment_name: booking-staging
+      stack_path: stacks/services/booking
+      environment: staging
+      contract_version: ${{ inputs.contract_version || 'latest' }}
+      apply_changes: ${{ inputs.apply_changes == true || (github.event_name == 'push' && github.ref == 'refs/heads/master') }}
