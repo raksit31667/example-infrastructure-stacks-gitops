@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "github-actions-templates": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "computedHash": "8604814828637308a8cdc45c53e647f0029395328184937312330e4b8e8c587f"
+    },
+    "terraform-stacks": {
+      "source": "hashicorp/agent-skills",
+      "sourceType": "github",
+      "computedHash": "c90c845f0d9b08341d6c85d6957f105e8973582870f4a6601f5366dc57d8171a"
+    }
+  }
+}
