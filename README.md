@@ -9,9 +9,9 @@ This repository is split into two independently operated layers:
 | Layer | What it manages | Trigger |
 |---|---|---|
 | **Infrastructure** | VPC, EKS control plane, node groups | Manual `workflow_dispatch` only |
-| **Microservices** | ECR, ElastiCache, Secrets Manager per service | Manual `workflow_dispatch` or push to `master` |
+| **Microservices** | ECR, ElastiCache, Secrets Manager, IRSA IAM role/policies per service | Manual `workflow_dispatch` or push to `master` |
 
-The layers are decoupled via an **infrastructure contract** — a JSON document published to S3 after a successful infrastructure apply. Microservice stacks read the contract to obtain VPC and security group IDs rather than querying AWS directly at plan time.
+The layers are decoupled via an **infrastructure contract** — a JSON document published to S3 after a successful infrastructure apply. Microservice stacks read the contract to obtain VPC, security group IDs, and EKS OIDC provider details rather than querying AWS directly at plan time.
 
 ## Repository Layout
 
@@ -43,7 +43,8 @@ The layers are decoupled via an **infrastructure contract** — a JSON document 
 │           └── modules/
 │               ├── ecr/             # ECR repository with lifecycle policy
 │               ├── elasticache/     # Serverless ElastiCache (Valkey/Redis)
-│               └── secret/          # AWS Secrets Manager secret
+│               ├── secret/          # AWS Secrets Manager secret
+│               └── irsa/            # IAM role/policies for Kubernetes service account
 │
 ├── .github/
 │   └── workflows/
@@ -87,7 +88,11 @@ For the booking microservice deployment file, also replace:
 | `<VPC_ID_*>` | Injected automatically by the microservice workflow from the infrastructure contract in S3 |
 | `<PRIVATE_SUBNETS_*_JSON>` | Injected automatically by the microservice workflow from the infrastructure contract in S3 |
 | `<ELASTICACHE_SG_ID_*>` | Injected automatically by the microservice workflow from the infrastructure contract in S3 |
+| `<OIDC_PROVIDER_ARN_*>` | Injected automatically by the microservice workflow from the infrastructure contract in S3 |
+| `<OIDC_PROVIDER_URL_*>` | Injected automatically by the microservice workflow from the infrastructure contract in S3 |
 | `<BOOKING_*_SECRET_JSON>` | AWS Secrets Manager or your secrets store |
+
+`k8s_namespace` and `k8s_service_account_name` are currently hardcoded in `booking.tfdeploy.hcl`.
 
 ## Pipelines
 
@@ -127,8 +132,12 @@ Contract schema:
   "private_subnets": ["..."],
   "public_subnets": ["..."],
   "cluster_name": "...",
+  "cluster_endpoint": "...",
+  "cluster_ca": "...",
   "cluster_sg_id": "...",
   "elasticache_sg_id": "...",
+  "oidc_provider_arn": "...",
+  "oidc_provider_url": "...",
   "account_id": "...",
   "environment": "...",
   "git_sha": "...",
@@ -187,13 +196,14 @@ The `resolve_contract` job downloads the specified contract version from S3 and 
 
 ## Microservice Stack Components (booking template)
 
-Components deploy in this order: `secret` → `elasticache` (parallel with) `ecr`.
+Components deploy in this order: `secret` → `elasticache` and `ecr` → `irsa`.
 
 | Component | Resources |
 |---|---|
 | `secret` | `aws_secretsmanager_secret` + `aws_secretsmanager_secret_version` |
 | `elasticache` | Serverless `aws_elasticache_serverless_cache`, user group, disabled default user, service user with `random_password` |
 | `ecr` | `aws_ecr_repository` (IMMUTABLE tags, KMS encryption) + lifecycle policy |
+| `irsa` | `aws_iam_role` with OIDC trust policy + least-privilege inline policies for `elasticache:Connect` and Secrets Manager read |
 
 ## Adding a New Service
 
@@ -211,6 +221,7 @@ Components deploy in this order: `secret` → `elasticache` (parallel with) `ecr
 - `identity_token` variables are declared `ephemeral = true` so they never persist in Terraform state.
 - `secret_string` variables are declared `sensitive = true` and `ephemeral = true`.
 - ElastiCache default user is disabled (`off -@all`); only the service user has access.
+- Service pods use IRSA with an OIDC trust policy scoped to a single Kubernetes service account.
 - ECR repositories use KMS encryption and immutable image tags by default.
 - Concurrency groups prevent overlapping applies on the same environment.
 - Production apply requires a manual approval in the `infra-release` GitHub environment.

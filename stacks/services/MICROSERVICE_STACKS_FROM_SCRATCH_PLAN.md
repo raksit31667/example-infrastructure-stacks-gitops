@@ -1,3 +1,17 @@
+## Current Implementation Notes
+
+The current repository implementation includes additional behavior beyond the original from-scratch plan:
+
+- Added module: `stacks/services/booking/modules/irsa`.
+- Booking stack now wires an `irsa` component that depends on both `secret` and `elasticache` outputs.
+- Infrastructure contract now includes `oidc_provider_arn` and `oidc_provider_url`.
+- Reusable microservice workflow resolves those OIDC fields from contract and injects them into deploy placeholders.
+- Booking deployment inputs currently hardcode:
+  - `k8s_namespace = "booking"`
+  - `k8s_service_account_name = "booking"`
+
+Use these notes as the source of truth when this document differs from current stack/workflow files.
+
 ## Part 1: Refactored Module Files (For stacks/services/{service}/modules/)
 
 These are transformations of your existing microservice/ modules to work with Stacks.

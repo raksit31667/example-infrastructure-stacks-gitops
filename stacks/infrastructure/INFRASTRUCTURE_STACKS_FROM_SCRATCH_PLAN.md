@@ -66,7 +66,7 @@ stacks/
 
 ### Phase E: Contract Publication and Handoff
 1. Publish infrastructure contract after successful apply:
-   - required keys: `vpc_id`, `private_subnets`, `public_subnets`, `cluster_name`, `cluster_sg_id`, `elasticache_sg_id`.
+   - required keys: `vpc_id`, `private_subnets`, `public_subnets`, `cluster_name`, `cluster_endpoint`, `cluster_ca`, `cluster_sg_id`, `elasticache_sg_id`, `oidc_provider_arn`, `oidc_provider_url`.
    - metadata: `account_id`, `environment`, `git_sha`, `run_id`, `timestamp`, `contract_version`.
 2. Store contract in durable location (recommended S3 with versioning).
 3. Microservice workflow requires operator-supplied `contract_version` input.
