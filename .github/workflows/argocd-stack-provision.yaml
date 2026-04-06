@@ -1,12 +1,16 @@
 name: ArgoCD Stack Provision (Reusable)
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       environment:
-        type: string
+        description: "Target environment"
         required: true
-        description: "Target environment (infratest, staging, production)"
+        type: choice
+        options:
+          - infratest
+          - staging
+          - production
       contract_version:
         type: string
         required: false
@@ -41,7 +45,6 @@ jobs:
     outputs:
       cluster_endpoint: ${{ steps.parse.outputs.cluster_endpoint }}
       cluster_ca: ${{ steps.parse.outputs.cluster_ca }}
-      cluster_token: ${{ steps.parse.outputs.cluster_token }}
       cluster_name: ${{ steps.parse.outputs.cluster_name }}
       contract_version: ${{ steps.parse.outputs.contract_version }}
     steps:
@@ -77,7 +80,7 @@ jobs:
           import json, sys, os
 
           required_keys = {
-            "cluster_endpoint", "cluster_ca", "cluster_token",
+            "cluster_endpoint", "cluster_ca",
             "cluster_name", "environment", "contract_version"
           }
 
@@ -101,7 +104,6 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
             out.write(f"cluster_endpoint={c['cluster_endpoint']}\n")
             out.write(f"cluster_ca={c['cluster_ca']}\n")
-            out.write(f"cluster_token={c['cluster_token']}\n")
             out.write(f"cluster_name={c['cluster_name']}\n")
             out.write(f"contract_version={c['contract_version']}\n")
 
@@ -167,6 +169,16 @@ jobs:
           
           echo "✓ Cluster credentials injected into ${DEPLOY_FILE} from infrastructure contract"
 
+      - name: Generate cluster token (just-in-time)
+        id: plan_token
+        env:
+          CLUSTER_NAME: ${{ needs.resolve_contract.outputs.cluster_name }}
+        run: |
+          TOKEN_JSON=$(aws eks get-token --cluster-name "${CLUSTER_NAME}" --region ${{ env.AWS_REGION }})
+          CLUSTER_TOKEN=$(echo "${TOKEN_JSON}" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['status']['token'])")
+          echo "::add-mask::${CLUSTER_TOKEN}"
+          echo "cluster_token=${CLUSTER_TOKEN}" >> "$GITHUB_OUTPUT"
+
       - name: Terraform Stacks Plan
         id: plan
         working-directory: ${{ env.STACK_PATH }}
@@ -174,7 +186,7 @@ jobs:
           TF_LOG: "WARN"
           TF_VAR_cluster_endpoint: ${{ needs.resolve_contract.outputs.cluster_endpoint }}
           TF_VAR_cluster_ca: ${{ needs.resolve_contract.outputs.cluster_ca }}
-          TF_VAR_cluster_token: ${{ needs.resolve_contract.outputs.cluster_token }}
+          TF_VAR_cluster_token: ${{ steps.plan_token.outputs.cluster_token }}
         run: |
           terraform stacks plan \
             -deployment ${{ inputs.environment }} \
@@ -272,13 +284,23 @@ jobs:
           
           echo "✓ Cluster credentials injected from contract version ${{ needs.resolve_contract.outputs.contract_version }}"
 
+      - name: Generate cluster token (just-in-time)
+        id: apply_token
+        env:
+          CLUSTER_NAME: ${{ needs.resolve_contract.outputs.cluster_name }}
+        run: |
+          TOKEN_JSON=$(aws eks get-token --cluster-name "${CLUSTER_NAME}" --region ${{ env.AWS_REGION }})
+          CLUSTER_TOKEN=$(echo "${TOKEN_JSON}" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['status']['token'])")
+          echo "::add-mask::${CLUSTER_TOKEN}"
+          echo "cluster_token=${CLUSTER_TOKEN}" >> "$GITHUB_OUTPUT"
+
       - name: Terraform Stacks Apply
         working-directory: ${{ env.STACK_PATH }}
         env:
           TF_LOG: "WARN"
           TF_VAR_cluster_endpoint: ${{ needs.resolve_contract.outputs.cluster_endpoint }}
           TF_VAR_cluster_ca: ${{ needs.resolve_contract.outputs.cluster_ca }}
-          TF_VAR_cluster_token: ${{ needs.resolve_contract.outputs.cluster_token }}
+          TF_VAR_cluster_token: ${{ steps.apply_token.outputs.cluster_token }}
         run: |
           terraform stacks apply \
             -deployment ${{ inputs.environment }} \

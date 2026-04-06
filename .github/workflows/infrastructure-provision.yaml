@@ -199,14 +199,7 @@ jobs:
           CLUSTER_ENDPOINT=$(terraform stacks output -deployment ${{ inputs.environment }} -raw cluster_endpoint)
           CLUSTER_CA=$(terraform stacks output -deployment ${{ inputs.environment }} -raw cluster_certificate_authority_data)
 
-          TOKEN_JSON=$(aws eks get-token --cluster-name "${CLUSTER_NAME}" --region ${{ env.AWS_REGION }} 2>/dev/null || echo '{}')
-          CLUSTER_TOKEN=$(echo "${TOKEN_JSON}" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('status', {}).get('token', ''))" 2>/dev/null || echo "")
-
-          if [ -z "$CLUSTER_TOKEN" ]; then
-            echo "WARNING: Failed to generate cluster token; contract will include endpoint and CA only"
-          fi
-
-          # Regenerate contract with cluster credentials
+          # Generate contract payload with stable infrastructure metadata and cluster endpoint details
           cat > contract.json <<EOF
           {
             "vpc_id": "${VPC_ID}",
@@ -215,7 +208,6 @@ jobs:
             "cluster_name": "${CLUSTER_NAME}",
             "cluster_endpoint": "${CLUSTER_ENDPOINT}",
             "cluster_ca": "${CLUSTER_CA}",
-            "cluster_token": "${CLUSTER_TOKEN}",
             "cluster_sg_id": "${CLUSTER_SG_ID}",
             "elasticache_sg_id": "${ELASTICACHE_SG_ID}",
             "account_id": "<AWS_ACCOUNT_ID>",
