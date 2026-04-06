@@ -97,3 +97,27 @@ variable "secret_recovery_window_days" {
   description = "Recovery window for secret deletion (days)"
   default     = 7
 }
+
+# ── IRSA ──────────────────────────────────────────────────────────────────────
+
+variable "oidc_provider_arn" {
+  type        = string
+  description = "EKS OIDC provider ARN (from infrastructure stack contract)"
+}
+
+variable "oidc_provider_url" {
+  type        = string
+  description = "EKS OIDC provider URL without https:// (from infrastructure stack contract)"
+}
+
+variable "k8s_namespace" {
+  type        = string
+  description = "Kubernetes namespace where the service account lives"
+  default     = "booking"
+}
+
+variable "k8s_service_account_name" {
+  type        = string
+  description = "Kubernetes service account name to bind to the IRSA role"
+  default     = "booking"
+}

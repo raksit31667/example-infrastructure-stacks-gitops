@@ -198,6 +198,9 @@ jobs:
           ELASTICACHE_SG_ID=$(terraform stacks output -deployment ${{ inputs.environment }} -raw elasticache_sg_id)
           CLUSTER_ENDPOINT=$(terraform stacks output -deployment ${{ inputs.environment }} -raw cluster_endpoint)
           CLUSTER_CA=$(terraform stacks output -deployment ${{ inputs.environment }} -raw cluster_certificate_authority_data)
+          OIDC_PROVIDER_ARN=$(terraform stacks output -deployment ${{ inputs.environment }} -raw oidc_provider_arn)
+          OIDC_ISSUER_URL=$(terraform stacks output -deployment ${{ inputs.environment }} -raw cluster_oidc_issuer_url)
+          OIDC_PROVIDER_URL=${OIDC_ISSUER_URL#https://}
 
           # Generate contract payload with stable infrastructure metadata and cluster endpoint details
           cat > contract.json <<EOF
@@ -210,6 +213,8 @@ jobs:
             "cluster_ca": "${CLUSTER_CA}",
             "cluster_sg_id": "${CLUSTER_SG_ID}",
             "elasticache_sg_id": "${ELASTICACHE_SG_ID}",
+            "oidc_provider_arn": "${OIDC_PROVIDER_ARN}",
+            "oidc_provider_url": "${OIDC_PROVIDER_URL}",
             "account_id": "<AWS_ACCOUNT_ID>",
             "environment": "${{ inputs.environment }}",
             "git_sha": "${{ github.sha }}",
@@ -231,6 +236,7 @@ jobs:
             "vpc_id", "private_subnets", "public_subnets",
             "cluster_name", "cluster_sg_id", "elasticache_sg_id",
             "cluster_endpoint", "cluster_ca",
+            "oidc_provider_arn", "oidc_provider_url",
             "account_id", "environment", "git_sha", "run_id",
             "timestamp", "contract_version"
           }

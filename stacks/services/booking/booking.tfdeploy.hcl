@@ -32,6 +32,11 @@ deployment "booking-production" {
     # Provide via HCP Terraform variable set or environment secret
     secret_string               = "<BOOKING_PRODUCTION_SECRET_JSON>"
     secret_recovery_window_days = 7
+
+    oidc_provider_arn        = "<OIDC_PROVIDER_ARN_PRODUCTION>"
+    oidc_provider_url        = "<OIDC_PROVIDER_URL_PRODUCTION>"
+    k8s_namespace            = "booking"
+    k8s_service_account_name = "booking"
   }
 }
 
@@ -60,6 +65,11 @@ deployment "booking-staging" {
 
     secret_string               = "<BOOKING_STAGING_SECRET_JSON>"
     secret_recovery_window_days = 7
+
+    oidc_provider_arn        = "<OIDC_PROVIDER_ARN_STAGING>"
+    oidc_provider_url        = "<OIDC_PROVIDER_URL_STAGING>"
+    k8s_namespace            = "booking"
+    k8s_service_account_name = "booking"
   }
 }
 
@@ -88,5 +98,10 @@ deployment "booking-test" {
 
     secret_string               = "<BOOKING_TEST_SECRET_JSON>"
     secret_recovery_window_days = 7
+
+    oidc_provider_arn        = "<OIDC_PROVIDER_ARN_TEST>"
+    oidc_provider_url        = "<OIDC_PROVIDER_URL_TEST>"
+    k8s_namespace            = "booking"
+    k8s_service_account_name = "booking"
   }
 }

@@ -33,3 +33,13 @@ output "connection_string" {
   description = "ElastiCache connection string (endpoint:port)"
   value       = "${aws_elasticache_serverless_cache.main.endpoint[0].address}:${aws_elasticache_serverless_cache.main.endpoint[0].port}"
 }
+
+output "cache_arn" {
+  description = "ElastiCache serverless cache ARN"
+  value       = aws_elasticache_serverless_cache.main.arn
+}
+
+output "service_user_arn" {
+  description = "ElastiCache service user ARN"
+  value       = aws_elasticache_user.service.arn
+}

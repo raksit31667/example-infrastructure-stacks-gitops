@@ -57,3 +57,15 @@ output "secret_name" {
   description = "Secrets Manager secret name"
   value       = component.secret.secret_name
 }
+
+output "irsa_role_arn" {
+  type        = string
+  description = "IRSA IAM role ARN for the booking service"
+  value       = component.irsa.role_arn
+}
+
+output "irsa_role_name" {
+  type        = string
+  description = "IRSA IAM role name for the booking service"
+  value       = component.irsa.role_name
+}

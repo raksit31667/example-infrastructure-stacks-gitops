@@ -53,6 +53,8 @@ jobs:
       vpc_id: ${{ steps.parse.outputs.vpc_id }}
       elasticache_sg_id: ${{ steps.parse.outputs.elasticache_sg_id }}
       private_subnets: ${{ steps.parse.outputs.private_subnets }}
+      oidc_provider_arn: ${{ steps.parse.outputs.oidc_provider_arn }}
+      oidc_provider_url: ${{ steps.parse.outputs.oidc_provider_url }}
       contract_version: ${{ steps.parse.outputs.contract_version }}
     steps:
       - name: Configure AWS credentials (OIDC)
@@ -88,6 +90,7 @@ jobs:
 
           required_keys = {
             "vpc_id", "private_subnets", "elasticache_sg_id",
+            "oidc_provider_arn", "oidc_provider_url",
             "environment", "contract_version"
           }
 
@@ -112,6 +115,8 @@ jobs:
             out.write(f"vpc_id={c['vpc_id']}\n")
             out.write(f"elasticache_sg_id={c['elasticache_sg_id']}\n")
             out.write(f"private_subnets={json.dumps(c['private_subnets'])}\n")
+            out.write(f"oidc_provider_arn={c['oidc_provider_arn']}\n")
+            out.write(f"oidc_provider_url={c['oidc_provider_url']}\n")
             out.write(f"contract_version={c['contract_version']}\n")
 
           print(f"Contract validated: {c['contract_version']}")
@@ -154,6 +159,8 @@ jobs:
           VPC_ID: ${{ needs.resolve_contract.outputs.vpc_id }}
           ELASTICACHE_SG_ID: ${{ needs.resolve_contract.outputs.elasticache_sg_id }}
           PRIVATE_SUBNETS_JSON: ${{ needs.resolve_contract.outputs.private_subnets }}
+          OIDC_PROVIDER_ARN: ${{ needs.resolve_contract.outputs.oidc_provider_arn }}
+          OIDC_PROVIDER_URL: ${{ needs.resolve_contract.outputs.oidc_provider_url }}
           TARGET_ENV: ${{ inputs.environment }}
         run: |
           DEPLOY_FILE=$(find . -maxdepth 1 -name "*.tfdeploy.hcl" | head -1)
@@ -169,6 +176,8 @@ jobs:
             -e "s|<VPC_ID_${ENV_UPPER}>|${VPC_ID}|g" \
             -e "s|<ELASTICACHE_SG_ID_${ENV_UPPER}>|${ELASTICACHE_SG_ID}|g" \
             -e "s|<PRIVATE_SUBNETS_${ENV_UPPER}_JSON>|${PRIVATE_SUBNETS_JSON_ESCAPED}|g" \
+            -e "s|<OIDC_PROVIDER_ARN_${ENV_UPPER}>|${OIDC_PROVIDER_ARN}|g" \
+            -e "s|<OIDC_PROVIDER_URL_${ENV_UPPER}>|${OIDC_PROVIDER_URL}|g" \
             "${DEPLOY_FILE}"
 
           echo "Injected contract values into ${DEPLOY_FILE}"
@@ -256,6 +265,8 @@ jobs:
           VPC_ID: ${{ needs.resolve_contract.outputs.vpc_id }}
           ELASTICACHE_SG_ID: ${{ needs.resolve_contract.outputs.elasticache_sg_id }}
           PRIVATE_SUBNETS_JSON: ${{ needs.resolve_contract.outputs.private_subnets }}
+          OIDC_PROVIDER_ARN: ${{ needs.resolve_contract.outputs.oidc_provider_arn }}
+          OIDC_PROVIDER_URL: ${{ needs.resolve_contract.outputs.oidc_provider_url }}
           TARGET_ENV: ${{ inputs.environment }}
         run: |
           DEPLOY_FILE=$(find . -maxdepth 1 -name "*.tfdeploy.hcl" | head -1)
@@ -271,6 +282,8 @@ jobs:
             -e "s|<VPC_ID_${ENV_UPPER}>|${VPC_ID}|g" \
             -e "s|<ELASTICACHE_SG_ID_${ENV_UPPER}>|${ELASTICACHE_SG_ID}|g" \
             -e "s|<PRIVATE_SUBNETS_${ENV_UPPER}_JSON>|${PRIVATE_SUBNETS_JSON_ESCAPED}|g" \
+            -e "s|<OIDC_PROVIDER_ARN_${ENV_UPPER}>|${OIDC_PROVIDER_ARN}|g" \
+            -e "s|<OIDC_PROVIDER_URL_${ENV_UPPER}>|${OIDC_PROVIDER_URL}|g" \
             "${DEPLOY_FILE}"
 
           echo "Injected contract values into ${DEPLOY_FILE}"
