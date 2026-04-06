@@ -72,6 +72,19 @@ stacks/
 3. Microservice workflow requires operator-supplied `contract_version` input.
 4. Fail microservice plan if contract missing or schema incompatible.
 
+### Phase F: ArgoCD Stack Foundation
+1. Create stack root at `stacks/argocd`.
+2. Add `.terraform-version` pinned to Terraform 1.14.x.
+3. Add provider configuration: AWS (for Secrets Manager), Kubernetes, Helm.
+4. Add stack variables for cluster credentials (endpoint, CA, token).
+5. Create module `argocd/` with:
+   - Kubernetes namespace resource.
+   - Helm release for ArgoCD chart with templated values.
+   - RBAC cluster role binding for application controller.
+   - Optional: Secrets for GitHub OAuth/deploy keys.
+6. Create environment deployment files: `infratest.tfdeploy.hcl`.
+7. Define stack outputs: namespace, release name/version, service endpoint.
+
 ## Workflow Design (Manual First)
 
 ### Infrastructure Workflow (manual)
@@ -83,9 +96,6 @@ stacks/
    - `plan`
    - `approval_gate` (environment approval)
    - `apply` (if approved and `apply_changes=true`)
-   - `test_network`
-   - `test_controlplane`
-   - `test_nodegroup`
    - `publish_contract`
 
 ### Microservice Workflow (manual)
