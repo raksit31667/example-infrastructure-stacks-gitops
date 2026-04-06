@@ -1,0 +1,27 @@
+# ArgoCD Stack - Infratest Environment Variables Template
+# Copy this file to infratest.auto.tfvars and fill in actual values
+
+aws_region     = "<AWS_REGION>"              # e.g., "ap-southeast-2"
+role_arn       = "<GITHUB_OIDC_ROLE_ARN>"    # e.g., "arn:aws:iam::123456789012:role/github-oidc"
+identity_token = ""                           # Provided by Terraform at runtime via OIDC
+
+environment               = "infratest"
+cluster_name              = "<PROJECT_OR_STACK_NAME>-infratest-eks"  # e.g., "jedis-infratest-eks"
+cluster_endpoint          = "<CLUSTER_ENDPOINT>"                     # e.g., "https://ABC.eks.ap-southeast-2.amazonaws.com"
+cluster_ca                = "<CLUSTER_CA_CERTIFICATE_BASE64>"       # Output from `aws eks describe-cluster`
+cluster_token             = ""                                        # Provided by Terraform IAM auth at runtime
+
+argocd_namespace          = "argocd"
+argocd_helm_version       = "5.46.8"
+project_or_stack_name     = "<PROJECT_OR_STACK_NAME>"                # e.g., "jedis"
+argocd_replicas           = 1
+argocd_dex_enabled        = false
+argocd_admin_password_secret_id = "argocd-admin-password-infratest"
+github_oauth_secret_id    = ""
+
+common_tags = {
+  ManagedBy   = "Terraform"
+  Stack       = "argocd"
+  Environment = "infratest"
+  Owner       = "<OWNER_TEAM>"
+}

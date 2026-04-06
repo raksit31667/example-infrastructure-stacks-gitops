@@ -1,0 +1,430 @@
+name: ArgoCD Stack Provision (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+        description: "Target environment (infratest, staging, production)"
+      contract_version:
+        type: string
+        required: false
+        default: "latest"
+        description: "Infrastructure contract version to validate against (use 'latest' for most recent)"
+      apply_changes:
+        type: boolean
+        required: false
+        default: false
+        description: "Whether to apply changes (true for direct deploy, false for validation-only)"
+
+concurrency:
+  group: argocd-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.14.0"
+  AWS_REGION: "<AWS_REGION>"
+  STACK_PATH: "stacks/argocd"
+  CONTRACT_BUCKET: "<TF_STATE_BUCKET_NAME>"
+
+jobs:
+  # ── Resolve & Validate Contract ───────────────────────────────────────────
+  resolve_contract:
+    name: Resolve Contract — ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    outputs:
+      cluster_endpoint: ${{ steps.parse.outputs.cluster_endpoint }}
+      cluster_ca: ${{ steps.parse.outputs.cluster_ca }}
+      cluster_token: ${{ steps.parse.outputs.cluster_token }}
+      cluster_name: ${{ steps.parse.outputs.cluster_name }}
+      contract_version: ${{ steps.parse.outputs.contract_version }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: argocd-contract-${{ github.run_id }}
+
+      - name: Download contract from S3
+        run: |
+          if [[ "${{ inputs.contract_version }}" == "latest" ]]; then
+            OBJECT_KEY="contracts/${{ inputs.environment }}/latest.json"
+          else
+            OBJECT_KEY="contracts/${{ inputs.environment }}/contract-${{ inputs.contract_version }}.json"
+          fi
+
+          echo "Downloading: s3://${{ env.CONTRACT_BUCKET }}/${OBJECT_KEY}"
+          aws s3 cp \
+            "s3://${{ env.CONTRACT_BUCKET }}/${OBJECT_KEY}" \
+            contract.json \
+            --region ${{ env.AWS_REGION }} || {
+              echo "ERROR: Infrastructure contract not found at s3://${{ env.CONTRACT_BUCKET }}/${OBJECT_KEY}"
+              echo "Run the infrastructure-provision workflow for the '${{ inputs.environment }}' environment first."
+              exit 1
+            }
+
+      - name: Validate contract schema and extract cluster credentials
+        id: parse
+        run: |
+          python3 - <<'PYEOF'
+          import json, sys, os
+
+          required_keys = {
+            "cluster_endpoint", "cluster_ca", "cluster_token",
+            "cluster_name", "environment", "contract_version"
+          }
+
+          with open("contract.json") as f:
+            c = json.load(f)
+
+          missing = required_keys - set(c.keys())
+          if missing:
+            print(f"ERROR: Contract missing required keys: {missing}", file=sys.stderr)
+            sys.exit(1)
+
+          if c["environment"] != os.environ["TARGET_ENV"]:
+            print(
+              f"ERROR: Contract environment '{c['environment']}' does not match "
+              f"expected '{os.environ['TARGET_ENV']}'",
+              file=sys.stderr,
+            )
+            sys.exit(1)
+
+          # Emit outputs
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"cluster_endpoint={c['cluster_endpoint']}\n")
+            out.write(f"cluster_ca={c['cluster_ca']}\n")
+            out.write(f"cluster_token={c['cluster_token']}\n")
+            out.write(f"cluster_name={c['cluster_name']}\n")
+            out.write(f"contract_version={c['contract_version']}\n")
+
+          print(f"Contract validated: {c['contract_version']}")
+          PYEOF
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+
+  # ── Validate & Plan ───────────────────────────────────────────────────────
+  validate_and_plan:
+    name: Validate & Plan — ArgoCD
+    needs: [resolve_contract]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: argocd-plan-${{ github.run_id }}
+
+      - name: Terraform Stacks Init
+        working-directory: ${{ env.STACK_PATH }}
+        run: terraform stacks init
+
+      - name: Terraform Stacks Validate
+        working-directory: ${{ env.STACK_PATH }}
+        run: terraform stacks validate
+
+      - name: Inject cluster credentials into deploy file
+        working-directory: ${{ env.STACK_PATH }}
+        env:
+          CLUSTER_ENDPOINT: ${{ needs.resolve_contract.outputs.cluster_endpoint }}
+          CLUSTER_CA: ${{ needs.resolve_contract.outputs.cluster_ca }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          set -e
+          
+          # Select the appropriate deployment file based on environment
+          DEPLOY_FILE="${{ inputs.environment }}.tfdeploy.hcl"
+          
+          if [[ ! -f "${DEPLOY_FILE}" ]]; then
+            echo "ERROR: Deployment file not found: ${DEPLOY_FILE}"
+            exit 1
+          fi
+          
+          echo "Injecting cluster credentials into ${DEPLOY_FILE}"
+          
+          # Replace placeholders with actual cluster values from contract
+          # Note: Using | as delimiter for sed to avoid issues with / in base64/URLs
+          sed -i \
+            -e "s|<CLUSTER_ENDPOINT_PLACEHOLDER>|${CLUSTER_ENDPOINT}|g" \
+            -e "s|<CLUSTER_CA_CERT_PLACEHOLDER>|${CLUSTER_CA}|g" \
+            "${DEPLOY_FILE}"
+          
+          echo "✓ Cluster credentials injected into ${DEPLOY_FILE} from infrastructure contract"
+
+      - name: Terraform Stacks Plan
+        id: plan
+        working-directory: ${{ env.STACK_PATH }}
+        env:
+          TF_LOG: "WARN"
+          TF_VAR_cluster_endpoint: ${{ needs.resolve_contract.outputs.cluster_endpoint }}
+          TF_VAR_cluster_ca: ${{ needs.resolve_contract.outputs.cluster_ca }}
+          TF_VAR_cluster_token: ${{ needs.resolve_contract.outputs.cluster_token }}
+        run: |
+          terraform stacks plan \
+            -deployment ${{ inputs.environment }} \
+            -no-color 2>&1 | tee plan.log
+          echo "plan_exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: argocd-plan-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.STACK_PATH }}/plan.log
+          retention-days: 7
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.STACK_PATH }}/plan.log', 'utf8');
+            const body = [
+              `## ArgoCD Stack Plan: \`${{ inputs.environment }}\``,
+              `> Cluster: \`${{ needs.resolve_contract.outputs.cluster_name }}\` | Contract version: \`${{ needs.resolve_contract.outputs.contract_version }}\``,
+              '```',
+              plan.substring(0, 60000),
+              '```',
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+  # ── Approval Gate ─────────────────────────────────────────────────────────
+  approval_gate:
+    name: Approval Gate — ArgoCD
+    needs: [validate_and_plan]
+    runs-on: ubuntu-latest
+    environment: infra-release
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Deployment approved
+        run: echo "✓ ArgoCD deployment to ${{ inputs.environment }} approved by ${{ github.actor }} using contract ${{ needs.validate_and_plan.needs.resolve_contract.outputs.contract_version }}"
+
+  # ── Apply ─────────────────────────────────────────────────────────────────
+  apply:
+    name: Apply — ArgoCD
+    needs: [approval_gate, resolve_contract]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: argocd-apply-${{ github.run_id }}
+          role-duration-seconds: 1200
+
+      - name: Terraform Stacks Init
+        working-directory: ${{ env.STACK_PATH }}
+        run: terraform stacks init
+
+      - name: Inject cluster credentials into deploy file
+        working-directory: ${{ env.STACK_PATH }}
+        env:
+          CLUSTER_ENDPOINT: ${{ needs.resolve_contract.outputs.cluster_endpoint }}
+          CLUSTER_CA: ${{ needs.resolve_contract.outputs.cluster_ca }}
+          TARGET_ENV: ${{ inputs.environment }}
+        run: |
+          set -e
+          
+          DEPLOY_FILE="${{ inputs.environment }}.tfdeploy.hcl"
+          
+          if [[ ! -f "${DEPLOY_FILE}" ]]; then
+            echo "ERROR: Deployment file not found: ${DEPLOY_FILE}"
+            exit 1
+          fi
+          
+          echo "Injecting cluster credentials into ${DEPLOY_FILE} from infrastructure contract"
+          
+          sed -i \
+            -e "s|<CLUSTER_ENDPOINT_PLACEHOLDER>|${CLUSTER_ENDPOINT}|g" \
+            -e "s|<CLUSTER_CA_CERT_PLACEHOLDER>|${CLUSTER_CA}|g" \
+            "${DEPLOY_FILE}"
+          
+          echo "✓ Cluster credentials injected from contract version ${{ needs.resolve_contract.outputs.contract_version }}"
+
+      - name: Terraform Stacks Apply
+        working-directory: ${{ env.STACK_PATH }}
+        env:
+          TF_LOG: "WARN"
+          TF_VAR_cluster_endpoint: ${{ needs.resolve_contract.outputs.cluster_endpoint }}
+          TF_VAR_cluster_ca: ${{ needs.resolve_contract.outputs.cluster_ca }}
+          TF_VAR_cluster_token: ${{ needs.resolve_contract.outputs.cluster_token }}
+        run: |
+          terraform stacks apply \
+            -deployment ${{ inputs.environment }} \
+            -no-color 2>&1 | tee apply.log
+          echo "Apply exit code: ${PIPESTATUS[0]}"
+
+      - name: Upload apply artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: argocd-apply-${{ inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.STACK_PATH }}/apply.log
+          retention-days: 30
+
+  # ── Post-Deploy Verification ──────────────────────────────────────────────
+  verify_deployment:
+    name: Verify Deployment — ArgoCD
+    needs: [apply, resolve_contract]
+    runs-on: ubuntu-latest
+    if: ${{ inputs.apply_changes == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.28"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: <GITHUB_OIDC_ROLE_ARN>
+          role-session-name: argocd-verify-${{ github.run_id }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ needs.resolve_contract.outputs.cluster_name }} \
+            --region ${{ env.AWS_REGION }} \
+            --alias argocd-verify
+
+      - name: Verify ArgoCD namespace
+        run: |
+          echo "Checking ArgoCD namespace..."
+          kubectl get namespace argocd --context=argocd-verify || {
+            echo "ERROR: argocd namespace not found"
+            exit 1
+          }
+          echo "✓ ArgoCD namespace exists"
+
+      - name: Verify ArgoCD deployments
+        run: |
+          echo "Checking ArgoCD deployments..."
+          kubectl get deployments -n argocd --context=argocd-verify || {
+            echo "ERROR: Could not retrieve deployments"
+            exit 1
+          }
+          echo "✓ ArgoCD deployments retrieved"
+
+      - name: Wait for ArgoCD server to be ready
+        run: |
+          echo "Waiting for ArgoCD server to be ready (up to 5 minutes)..."
+          kubectl rollout status deployment/argocd-server \
+            -n argocd \
+            --context=argocd-verify \
+            --timeout=5m || {
+            echo "WARNING: ArgoCD server rollout did not complete in time"
+            echo "Checking pod status..."
+            kubectl get pods -n argocd --context=argocd-verify
+          }
+          echo "✓ ArgoCD server rollout status checked"
+
+      - name: Verify ArgoCD service
+        run: |
+          echo "Checking ArgoCD server service..."
+          SVC_IP=$(kubectl get svc argocd-server \
+            -n argocd \
+            --context=argocd-verify \
+            -o jsonpath='{.spec.clusterIP}' 2>/dev/null || echo "")
+          
+          if [[ -z "${SVC_IP}" ]]; then
+            echo "ERROR: ArgoCD server service not found or has no IP"
+            exit 1
+          fi
+          echo "✓ ArgoCD service available at ${SVC_IP}"
+
+      - name: Check ArgoCD RBAC
+        run: |
+          echo "Verifying ArgoCD cluster role binding..."
+          kubectl get clusterrolebinding argocd-manager \
+            --context=argocd-verify || {
+            echo "ERROR: argocd-manager cluster role binding not found"
+            exit 1
+          }
+          echo "✓ ArgoCD manager role binding exists"
+
+      - name: Generate post-deployment summary
+        if: always()
+        run: |
+          cat <<'EOF'
+          
+          ═══════════════════════════════════════════════════════════════
+          ArgoCD Deployment Summary
+          ═══════════════════════════════════════════════════════════════
+          
+          Environment:        ${{ inputs.environment }}
+          Cluster:            ${{ needs.resolve_contract.outputs.cluster_name }}
+          Region:             ${{ env.AWS_REGION }}
+          Contract Version:   ${{ needs.resolve_contract.outputs.contract_version }}
+          
+          Next Steps:
+          
+          1. Port-forward to ArgoCD server:
+             aws eks update-kubeconfig --name ${{ needs.resolve_contract.outputs.cluster_name }} --region ${{ env.AWS_REGION }}
+             kubectl port-forward -n argocd svc/argocd-server 8080:443
+          
+          2. Access UI at: https://localhost:8080
+             Username: admin
+             Password: Retrieve from AWS Secrets Manager
+             Secret ID: argocd-admin-password-${{ inputs.environment }}
+          
+          3. Verify repositories (if configured):
+             kubectl exec -it -n argocd deployment/argocd-server -- \
+               argocd repo list
+          
+          4. Create initial ApplicationSet for microservices:
+             See: MICROSERVICE_STACKS_FROM_SCRATCH_PLAN.md
+          
+          ═══════════════════════════════════════════════════════════════
+          EOF
+
+  # ── Summary ───────────────────────────────────────────────────────────────
+  summary:
+    name: Summary
+    needs: [validate_and_plan, verify_deployment]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Workflow result
+        run: |
+          if [[ "${{ needs.validate_and_plan.result }}" == "success" ]]; then
+            echo "✓ ArgoCD workflow completed successfully"
+            exit 0
+          else
+            echo "✗ ArgoCD workflow failed"
+            exit 1
+          fi

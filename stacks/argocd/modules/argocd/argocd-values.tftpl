@@ -1,0 +1,33 @@
+global:
+  addPrometheusAnnotations: false
+
+configs:
+  params:
+    server.insecure: true
+  cm:
+    application.instanceLabelKey: argocd.argoproj.io/instance
+%{ if admin_password_secret != "" ~}
+  secret:
+    argocdServerAdminPassword: ${admin_password_secret}
+    argocdServerAdminPasswordMtime: "1970-01-01T00:00:00Z"
+%{ endif ~}
+
+controller:
+  replicas: ${replicas}
+
+server:
+  replicas: ${replicas}
+  service:
+    type: ClusterIP
+
+repoServer:
+  replicas: ${replicas}
+
+applicationSet:
+  enabled: false
+
+dex:
+  enabled: ${dex_enabled}
+
+redis:
+  enabled: true
